@@ -1,0 +1,339 @@
+esphome:
+  name: pool-control
+  friendly_name: Aquagem Control
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+globals:
+  - id: modbus_enabled
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+preferences:
+  flash_write_interval: 60min
+
+logger:
+
+  level: DEBUG
+  logs:
+    modbus: DEBUG
+    modbus_controller: DEBUG
+    mqtt: DEBUG
+
+#  level: INFO
+#  logs:
+#    modbus: ERROR
+#    modbus_controller: ERROR
+#    mqtt: INFO
+
+ota:
+  - platform: esphome
+
+wifi:
+  power_save_mode: none
+  fast_connect: true
+  ssid: "secret"
+  password: "secret"
+  ap:
+    ssid: "Pool-Pump"
+    password: "secret"
+
+web_server:
+  port: 80
+  version: 3
+
+# ==================== MQTT KONFIGURATION ====================
+mqtt:
+  broker: "192.168.0.x"
+  topic_prefix: "pool/pumpe"
+  client_id: "pool_pumpe"
+  birth_message:
+    topic: "pool/pumpe/status/availability"
+    payload: "online"
+  will_message:
+    topic: "pool/pumpe/status/availability"
+    payload: "offline"
+
+  on_message:
+  # PUMPE EIN/AUS
+    - topic: pool/pumpe/switch/power/set
+      payload: "ON"
+      then:
+        - switch.turn_on: pump_power
+    - topic: pool/pumpe/switch/power/set
+      payload: "OFF"
+      then:
+        - switch.turn_off: pump_power
+
+captive_portal:
+
+# ==================== NATIVE MODBUS-HARDWARE BORDMITTEL ====================
+uart:
+  - id: modbus_uart
+    tx_pin: GPIO17
+    rx_pin: GPIO16
+    baud_rate: 9600
+    stop_bits: 1
+    data_bits: 8
+    parity: NONE
+
+modbus:
+  id: modbus_bus
+  uart_id: modbus_uart
+  flow_control_pin: GPIO04
+  send_wait_time: 1000ms
+
+modbus_controller:
+  - id: pump_controller
+    address: 0xAA 
+    modbus_id: modbus_bus
+    update_interval: never
+    command_throttle: 1000ms
+
+interval:
+  - interval: 10s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(modbus_enabled);
+          then:
+            - component.update: pump_controller
+
+# ==================== SENSOREN AUSWERTUNG ====================
+sensor:
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+
+  # MASTER BLOCK READ
+  # Liest 0x07D1 bis 0x07D9 in einem Rutsch
+  - platform: modbus_controller
+    modbus_controller_id: pump_controller
+    name: "Error Code"
+    id: pump_error_code
+    register_type: holding
+    address: 0x07D1
+    register_count: 9
+    value_type: U_WORD
+    icon: mdi:alert-circle-outline
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: pump_controller
+    name: "​Leistung in %"
+    id: pump_capacity_state
+    filters:
+      - timeout:
+          timeout: 30s
+          value: NAN
+    register_type: holding
+    address: 0x07D3
+    value_type: U_WORD
+    unit_of_measurement: "%"
+    icon: mdi:speedometer
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x > 0;'
+            then:
+              - switch.template.publish:
+                  id: pump_power
+                  state: ON
+            else:
+              - switch.template.publish:
+                  id: pump_power
+                  state: OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: pump_controller
+    name: "​​​Leistung"
+    id: pump_power_watt
+    register_type: holding
+    address: 0x07D4
+    value_type: U_WORD
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    icon: mdi:lightning-bolt
+
+  - platform: modbus_controller
+    modbus_controller_id: pump_controller
+    name: "​​​​​Flow Rate"
+    id: pump_flow_rate
+    register_type: holding
+    address: 0x07D5
+    value_type: U_WORD
+    unit_of_measurement: "L/min"
+    icon: mdi:water-pump
+
+  - platform: modbus_controller
+    modbus_controller_id: pump_controller
+    name: "​​​​Pressure"
+    id: pump_pressure
+    register_type: holding
+    address: 0x07D6
+    value_type: U_WORD
+    unit_of_measurement: "Bar"
+    accuracy_decimals: 2
+    icon: mdi:gauge
+    filters:
+      - multiply: 0.001
+
+  - platform: modbus_controller
+    modbus_controller_id: pump_controller
+    name: "​​​​​​Gesamtverbrauch"
+    id: pump_energy
+    register_type: holding
+    address: 0x07D7
+    value_type: U_WORD
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    icon: mdi:flash
+    filters:
+      - multiply: 0.001
+
+  - platform: modbus_controller
+    modbus_controller_id: pump_controller
+    name: "Pumpentyp IP"
+    id: pump_mode_code
+    register_type: holding
+    address: 0x07D8
+    value_type: U_WORD
+    icon: mdi:cog
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: pump_controller
+    name: "​​​​​​​​​Software Version"
+    id: pump_software_version
+    register_type: holding
+    address: 0x07D9
+    value_type: U_WORD
+    icon: mdi:information
+
+# ==================== FEHLERMELDUNGEN IM KLARTEXT ====================
+text_sensor:
+  - platform: template
+    name: "‍Error State"
+    id: pump_error_text
+    icon: mdi:alert
+    lambda: |-
+      uint16_t err = id(pump_error_code).state;
+      if (err == 0) return {"No Error"};
+      std::string result = "";
+      if (err & (1 << 0))  result += "Pressure Sensor; ";
+      if (err & (1 << 1))  result += "Communication; ";
+      if (err & (1 << 2))  result += "Dry Run; ";
+      if (err & (1 << 3))  result += "RTC Error; ";
+      if (err & (1 << 4))  result += "EEPROM Error; ";
+      if (err & (1 << 5))  result += "Circuit Board; ";
+      if (err & (1 << 6))  result += "Motor Overload; ";
+      if (err & (1 << 7))  result += "PFC Protection; ";
+      if (err & (1 << 8))  result += "DC Voltage; ";
+      if (err & (1 << 9))  result += "AC Current Sensor; ";
+      if (err & (1 << 10)) result += "Phase Deficient; ";
+      if (err & (1 << 11)) result += "Driver Board; ";
+      if (err & (1 << 12)) result += "Heatsink Sensor; ";
+      if (err & (1 << 13)) result += "Overtemperature; ";
+      if (err & (1 << 14)) result += "Output Overcurrent; ";
+      if (err & (1 << 15)) result += "Input Voltage; ";
+      return {result};
+
+  - platform: template
+    icon: mdi:water-pump
+    name: "​​​​​​​​Typ"
+    lambda: |-
+      int mode = id(pump_mode_code).state;
+      switch(mode) {
+        case 20: return {"InverPro IP20"};
+        case 25: return {"InverPro IP25"};
+        case 30: return {"InverPro IP30"};
+        case 40: return {"InverPro IP40"};
+        default: return {"Unknown"};
+      }
+
+# ==================== INTERFACE / BEDIENUNG ====================
+binary_sensor:
+  - platform: template
+    name: "Pumpe läuft"
+    id: pump_running
+    icon: mdi:pump
+    lambda: |-
+      return id(pump_capacity_state).state > 0;
+
+number:
+  # 7. Register 3001 (0x0BB9): Leistung setzen via FC10 (Write Multiple)
+  - platform: modbus_controller
+    modbus_controller_id: pump_controller
+
+    name: "​​Leistung SET"
+    id: pump_rpm
+    icon: "mdi:tune"
+    
+    register_type: holding
+    address: 0x0BB9
+    value_type: U_WORD
+    
+    min_value: 0
+    max_value: 120   
+    step: 5
+    
+    unit_of_measurement: "%"
+    use_write_multiple: true 
+    
+    state_topic: "pool/pumpe/number/capacity"
+    command_topic: "pool/pumpe/number/capacity/set"
+
+switch:
+  - platform: template
+    name: "‍‍‍‍‍‍‍‍‍ON - OFF"
+    id: pump_power
+    icon: "mdi:power"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    state_topic: "pool/pumpe/switch/power"
+    command_topic: "pool/pumpe/switch/power/set"
+    turn_on_action:
+      then:
+        - lambda: 'id(modbus_enabled) = true;'
+        - delay: 500ms
+        - number.set: { id: pump_rpm, value: 70 }
+        - logger.log: "Pumpe EIN"
+    turn_off_action:
+      then:
+        # 1. Polling stoppen
+        - lambda: 'id(modbus_enabled) = false;'
+        # 2. Warten bis ein laufender Read-Zyklus sicher durch ist
+        - delay: 10s
+        # 3. Dann ausschalten - Leistung auf 0
+        - number.set: { id: pump_rpm, value: 0 }
+
+# Polling schalten:
+  - platform: template
+    name: "Modbus Polling"
+    id: modbus_polling_switch
+    icon: "mdi:lan-connect"
+    optimistic: true
+    turn_on_action:
+      then:
+        - lambda: |-
+            id(modbus_enabled) = true;
+        - logger.log: "Modbus AKTIVIERT"
+    turn_off_action:
+      then:
+        - lambda: |-
+            id(modbus_enabled) = false;
+        - logger.log: "Modbus DEAKTIVIERT"
+
+  - platform: restart
+    name: "Restart"
+    id: controller_restart
+    icon: "mdi:restart"
